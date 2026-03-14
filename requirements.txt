@@ -1,0 +1,4 @@
+Flask
+curl_cffi
+requests
+gunicorn
