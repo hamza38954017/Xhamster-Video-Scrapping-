@@ -1,17 +1,18 @@
 import os
 import re
 import json
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, unquote
 from flask import Flask, request, render_template_string, Response
 from curl_cffi import requests as cffi_requests
 import requests as std_requests
 
 app = Flask(__name__)
 
-# The base domain to use for spoofing the CDN
+# The exact spoofing credentials
 BASE_DOMAIN = "https://xhamster45.desi"
+SPOOF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# The Frontend UI (HTML, CSS, and Video.js)
+# The Frontend UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -21,53 +22,13 @@ HTML_TEMPLATE = """
     <title>Video Streamer</title>
     <link href="https://vjs.zencdn.net/8.6.1/video-js.css" rel="stylesheet" />
     <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #0f0f0f;
-            color: #ffffff;
-            text-align: center;
-            padding: 40px 20px;
-            margin: 0;
-        }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f0f0f; color: #fff; text-align: center; padding: 40px 20px; margin: 0; }
         h1 { color: #ff4757; }
-        .search-container {
-            margin-bottom: 40px;
-            display: flex;
-            justify-content: center;
-            gap: 10px;
-        }
-        input[type="text"] {
-            width: 60%;
-            max-width: 600px;
-            padding: 12px 20px;
-            font-size: 16px;
-            border-radius: 8px;
-            border: 1px solid #333;
-            background: #222;
-            color: white;
-            outline: none;
-        }
-        input[type="text"]:focus { border-color: #ff4757; }
-        button {
-            padding: 12px 24px;
-            font-size: 16px;
-            background-color: #ff4757;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-            transition: 0.2s;
-        }
-        button:hover { background-color: #ff6b81; }
-        .video-wrapper {
-            max-width: 900px;
-            margin: 0 auto;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-            border-radius: 8px;
-            overflow: hidden;
-            background: #000;
-        }
+        .search-container { margin-bottom: 40px; display: flex; justify-content: center; gap: 10px; }
+        input[type="text"] { width: 60%; max-width: 600px; padding: 12px 20px; font-size: 16px; border-radius: 8px; border: 1px solid #333; background: #222; color: white; outline: none; }
+        button { padding: 12px 24px; font-size: 16px; background: #ff4757; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #ff6b81; }
+        .video-wrapper { max-width: 900px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.8); border-radius: 8px; overflow: hidden; background: #000; }
         .error { color: #ff6b81; font-weight: bold; margin-top: 20px; }
     </style>
 </head>
@@ -93,9 +54,7 @@ HTML_TEMPLATE = """
         </div>
         
         <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
-        <script>
-            var player = videojs('my-video', { fluid: true });
-        </script>
+        <script>var player = videojs('my-video', { fluid: true });</script>
     {% endif %}
 
 </body>
@@ -104,7 +63,6 @@ HTML_TEMPLATE = """
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Handles the Home Page and the Web Scraping."""
     stream_url = None
     quoted_stream_url = None
     title = "Video Player"
@@ -113,16 +71,12 @@ def index():
     if request.method == "POST":
         page_url = request.form.get("url")
         try:
-            # 1. Scrape the page using curl_cffi to bypass Cloudflare
             resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=15)
             html = resp.text
 
-            # 2. Extract Title
             title_match = re.search(r'<title>(.*?)</title>', html)
-            if title_match:
-                title = title_match.group(1).replace(" | xHamster", "").strip()
+            if title_match: title = title_match.group(1).replace(" | xHamster", "").strip()
 
-            # 3. Extract the fresh m3u8 link from the JSON block
             data = {}
             json_match = re.search(r'window\.initials\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
             if json_match:
@@ -143,7 +97,6 @@ def index():
                 if "hls" in sources: stream_url = sources["hls"].get("url")
                 elif "mp4" in sources: stream_url = sources["mp4"].get("url")
 
-            # Fallback regex
             if not stream_url:
                 m3u8_matches = re.findall(r'https?:\/\/[^\s<>"\'\\]+\.m3u8[^\s<>"\'\\]*', html)
                 if m3u8_matches:
@@ -153,7 +106,7 @@ def index():
             if stream_url:
                 quoted_stream_url = quote(stream_url)
             else:
-                error = "Could not find a valid stream link on that page. It might be a premium-only video."
+                error = "Could not find a valid stream link. The video might be premium-locked."
 
         except Exception as e:
             error = f"Error scraping page: {str(e)}"
@@ -163,19 +116,18 @@ def index():
 
 @app.route("/proxy")
 def proxy():
-    """
-    THE MAGIC SAUCE: 
-    This route intercepts the video player's requests, attaches the fake Referer, 
-    fetches the video from the CDN, and pipes it back to the frontend.
-    """
-    target_url = request.args.get("url")
-    if not target_url:
+    """Proxies the m3u8 playlists, AES keys, and .ts video chunks."""
+    
+    # Safe URL extraction (prevents query parameters from being chopped off)
+    try:
+        raw_url = request.url.split("url=", 1)[1]
+        target_url = unquote(raw_url)
+    except IndexError:
         return "No URL provided", 400
 
-    # Spoof the CDN
     headers = {
         "Referer": BASE_DOMAIN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": SPOOF_USER_AGENT
     }
 
     try:
@@ -183,25 +135,34 @@ def proxy():
     except Exception as e:
         return str(e), 500
 
-    # If the response is an M3U8 Playlist, we must rewrite the internal links 
-    # so the video chunks (.ts files) also route through this proxy.
+    # Handle M3U8 Playlists
     if ".m3u8" in target_url or "mpegurl" in req.headers.get("Content-Type", "").lower():
         content = req.text
+        
+        # FIX 1: Find and proxy hidden AES Decryption Keys inside the playlist
+        def replace_uri(match):
+            orig_uri = match.group(1)
+            abs_uri = urljoin(target_url, orig_uri)
+            return f'URI="/proxy?url={quote(abs_uri)}"'
+            
+        content = re.sub(r'URI="([^"]+)"', replace_uri, content)
+        
+        # FIX 2: Proxy all standard video chunk paths
         new_m3u8 = []
         for line in content.splitlines():
-            if line.startswith("#") or not line.strip():
-                new_m3u8.append(line) # Keep metadata tags intact
+            line = line.strip()
+            if line.startswith("#") or not line:
+                new_m3u8.append(line)
             else:
-                # Convert relative chunk links to absolute URLs, then wrap them in our proxy
-                absolute_url = urljoin(target_url, line.strip())
-                proxied_url = f"/proxy?url={quote(absolute_url)}"
-                new_m3u8.append(proxied_url)
-        
+                abs_url = urljoin(target_url, line)
+                new_m3u8.append(f"/proxy?url={quote(abs_url)}")
+                
         return Response("\n".join(new_m3u8), content_type="application/vnd.apple.mpegurl")
     
-    # If the response is the actual video data chunk (.ts or .mp4), stream it back directly
+    # Handle Video Chunks (.ts files)
     def generate():
-        for chunk in req.iter_content(chunk_size=1024 * 1024): # Stream in 1MB chunks
+        # FIX 3: Reduced chunk size to 64KB for smooth, instant web streaming
+        for chunk in req.iter_content(chunk_size=65536): 
             if chunk:
                 yield chunk
     
@@ -209,6 +170,5 @@ def proxy():
 
 
 if __name__ == "__main__":
-    # Render assigns a dynamic port, this grabs it automatically
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
