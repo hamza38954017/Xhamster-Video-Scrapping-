@@ -1,18 +1,15 @@
 import os
 import re
 import json
-from urllib.parse import urljoin, quote, unquote
+from urllib.parse import urljoin, quote, unquote, urlparse, urlunparse
 from flask import Flask, request, render_template_string, Response
 from curl_cffi import requests as cffi_requests
-import requests as std_requests
 
 app = Flask(__name__)
 
-# The exact spoofing credentials
 BASE_DOMAIN = "https://xhamster45.desi"
 SPOOF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# The Frontend UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -33,18 +30,12 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-
     <h1>🚀 Ultimate Video Streamer</h1>
-    
     <form class="search-container" method="POST" action="/">
         <input type="text" name="url" placeholder="Paste full video page URL here..." required>
         <button type="submit">Play Video</button>
     </form>
-
-    {% if error %}
-        <p class="error">⚠️ {{ error }}</p>
-    {% endif %}
-
+    {% if error %}<p class="error">⚠️ {{ error }}</p>{% endif %}
     {% if stream_url %}
         <h3 style="margin-bottom: 20px;">{{ title }}</h3>
         <div class="video-wrapper">
@@ -52,21 +43,28 @@ HTML_TEMPLATE = """
                 <source src="/proxy?url={{ quoted_stream_url }}" type="application/x-mpegURL">
             </video-js>
         </div>
-        
         <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
         <script>var player = videojs('my-video', { fluid: true });</script>
     {% endif %}
-
 </body>
 </html>
 """
 
+def smart_urljoin(base, link):
+    """Joins URLs while preserving required security query parameters (like ?token=...)."""
+    if link.startswith("http"):
+        return link
+    joined = urljoin(base, link)
+    base_parsed = urlparse(base)
+    joined_parsed = urlparse(joined)
+    # If the parent URL had a token but the child doesn't, inherit it.
+    if base_parsed.query and not joined_parsed.query:
+        joined = urlunparse(joined_parsed._replace(query=base_parsed.query))
+    return joined
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    stream_url = None
-    quoted_stream_url = None
-    title = "Video Player"
-    error = None
+    stream_url, quoted_stream_url, title, error = None, None, "Video Player", None
 
     if request.method == "POST":
         page_url = request.form.get("url")
@@ -116,9 +114,6 @@ def index():
 
 @app.route("/proxy")
 def proxy():
-    """Proxies the m3u8 playlists, AES keys, and .ts video chunks."""
-    
-    # Safe URL extraction (prevents query parameters from being chopped off)
     try:
         raw_url = request.url.split("url=", 1)[1]
         target_url = unquote(raw_url)
@@ -127,47 +122,55 @@ def proxy():
 
     headers = {
         "Referer": BASE_DOMAIN,
-        "User-Agent": SPOOF_USER_AGENT
+        "Origin": BASE_DOMAIN,
+        "User-Agent": SPOOF_USER_AGENT,
+        "Accept": "*/*"
     }
 
     try:
-        req = std_requests.get(target_url, headers=headers, stream=True, timeout=15)
+        # FIX 1: Use curl_cffi here to spoof Cloudflare for every single video chunk!
+        req = cffi_requests.get(target_url, headers=headers, stream=True, impersonate="chrome120", timeout=15)
     except Exception as e:
         return str(e), 500
 
+    # FIX 2: Do not swallow HTTP errors. If CDN blocks it, tell the video player!
+    if req.status_code >= 400:
+        return Response(req.content, status=req.status_code)
+
+    content_type = req.headers.get("Content-Type", "")
+
     # Handle M3U8 Playlists
-    if ".m3u8" in target_url or "mpegurl" in req.headers.get("Content-Type", "").lower():
+    if ".m3u8" in target_url or "mpegurl" in content_type.lower():
         content = req.text
         
-        # FIX 1: Find and proxy hidden AES Decryption Keys inside the playlist
         def replace_uri(match):
             orig_uri = match.group(1)
-            abs_uri = urljoin(target_url, orig_uri)
+            abs_uri = smart_urljoin(target_url, orig_uri)
             return f'URI="/proxy?url={quote(abs_uri)}"'
             
         content = re.sub(r'URI="([^"]+)"', replace_uri, content)
         
-        # FIX 2: Proxy all standard video chunk paths
         new_m3u8 = []
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("#") or not line:
                 new_m3u8.append(line)
             else:
-                abs_url = urljoin(target_url, line)
+                # FIX 3: Use smart joiner to preserve security tokens
+                abs_url = smart_urljoin(target_url, line)
                 new_m3u8.append(f"/proxy?url={quote(abs_url)}")
                 
         return Response("\n".join(new_m3u8), content_type="application/vnd.apple.mpegurl")
     
     # Handle Video Chunks (.ts files)
     def generate():
-        # FIX 3: Reduced chunk size to 64KB for smooth, instant web streaming
         for chunk in req.iter_content(chunk_size=65536): 
-            if chunk:
-                yield chunk
+            if chunk: yield chunk
     
-    return Response(generate(), content_type=req.headers.get("Content-Type", "video/mp2t"))
-
+    resp = Response(generate(), content_type=content_type or "video/mp2t")
+    # Tell the browser it's allowed to stream this proxy via CORS
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
